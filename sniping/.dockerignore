@@ -1,0 +1,21 @@
+# Build-irrelevant
+venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+.idea/
+
+# Secrets — never bake these into an image layer
+.env
+.env.local
+
+# Mutable runtime state — lives on the /data volume instead (see
+# docker/entrypoint.sh), not in the image
+sportybet/sessions/
+sportybet/sporty.db
+sportybet/.sporty_cache.json
+positions.db
+
+# Dev-only artifacts not read by any runtime code path
+sportybet/sporty_api_map.json
+archive/

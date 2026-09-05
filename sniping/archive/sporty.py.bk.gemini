@@ -1,0 +1,298 @@
+"""
+SportyBet Prediction & Booking Module (Refactored)
+"""
+
+import playwright_stealth
+import asyncio
+import json
+import logging
+import os
+import time
+import sys
+from dataclasses import dataclass, field
+from difflib import SequenceMatcher
+from typing import Optional
+
+import aiohttp
+#from playwright_stealth import stealth_async
+#from playwright_stealth import stealth_async_api
+from playwright_stealth import stealth
+
+# Assuming these exist in your config.py
+try:
+    from config import (
+        ODDS_API_KEY,
+        API_FOOTBALL_KEY,
+        SPORTYBET_PHONE,
+        SPORTYBET_PASSWORD,
+    )
+except ImportError:
+    ODDS_API_KEY = API_FOOTBALL_KEY = SPORTYBET_PHONE = SPORTYBET_PASSWORD = ""
+
+logger = logging.getLogger("sporty")
+logging.basicConfig(level=logging.INFO)
+
+# ── Data Classes ─────────────────────────────────────────────────────────────
+
+@dataclass
+class Game:
+    fixture_id: str
+    home_team: str
+    away_team: str
+    league: str
+    sport: str
+    sport_key: str
+    commence_time: str
+    odds_home: float = 0.0
+    odds_draw: float = 0.0
+    odds_away: float = 0.0
+    prob_home: float = 0.0
+    prob_draw: float = 0.0
+    prob_away: float = 0.0
+    api_football_prob: Optional[float] = None
+    implied_prob: float = 0.0
+    confidence: float = 0.0
+    best_pick: str = ""
+    best_odds: float = 0.0
+
+@dataclass
+class BetSelection:
+    game: Game
+    market: str
+    selection: str
+    odds: float
+    confidence: float
+
+@dataclass
+class BookingResult:
+    success: bool
+    booking_code: Optional[str] = None
+    total_odds: float = 0.0
+    num_selections: int = 0
+    selections_summary: str = ""
+    error: Optional[str] = None
+
+# ── Prediction Engine ────────────────────────────────────────────────────────
+
+class PredictionEngine:
+    ODDS_API_BASE = "https://api.the-odds-api.com/v4"
+    API_FOOTBALL_BASE = "https://v3.football.api-sports.io"
+
+    def __init__(self):
+        self._odds_cache = {}
+        self._pred_cache = {}
+        self._cache_ttl = 300
+
+    def _cache_valid(self, cache_entry) -> bool:
+        if not cache_entry: return False
+        ts, _ = cache_entry
+        return (time.time() - ts) < self._cache_ttl
+
+    async def get_odds(self, sport_key: str) -> list[Game]:
+        if not ODDS_API_KEY: return []
+        cached = self._odds_cache.get(sport_key)
+        if self._cache_valid(cached): return cached[1]
+
+        try:
+            url = f"{self.ODDS_API_BASE}/sports/{sport_key}/odds"
+            params = {
+                "apiKey": ODDS_API_KEY,
+                "regions": "eu",
+                "markets": "h2h",
+                "oddsFormat": "decimal",
+            }
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params, timeout=15) as resp:
+                    if resp.status != 200: return []
+                    data = await resp.json()
+
+            games = []
+            for event in data:
+                game = Game(
+                    fixture_id=event.get("id", ""),
+                    home_team=event.get("home_team", ""),
+                    away_team=event.get("away_team", ""),
+                    league=event.get("sport_title", ""),
+                    sport=event.get("sport_key", "").split("_")[0],
+                    sport_key=event.get("sport_key", ""),
+                    commence_time=event.get("commence_time", ""),
+                )
+                
+                h2h_odds = []
+                for bookmaker in event.get("bookmakers", []):
+                    for market in bookmaker.get("markets", []):
+                        if market.get("key") == "h2h":
+                            outcomes = {o["name"]: o["price"] for o in market.get("outcomes", [])}
+                            h2h_odds.append(outcomes)
+
+                if h2h_odds:
+                    home_vals = [o.get(game.home_team, 0) for o in h2h_odds if game.home_team in o]
+                    away_vals = [o.get(game.away_team, 0) for o in h2h_odds if game.away_team in o]
+                    draw_vals = [o.get("Draw", 0) for o in h2h_odds if "Draw" in o]
+
+                    game.odds_home = sum(home_vals) / len(home_vals) if home_vals else 0
+                    game.odds_away = sum(away_vals) / len(away_vals) if away_vals else 0
+                    game.odds_draw = sum(draw_vals) / len(draw_vals) if draw_vals else 0
+
+                    game.prob_home = (1 / game.odds_home) if game.odds_home > 0 else 0
+                    game.prob_away = (1 / game.odds_away) if game.odds_away > 0 else 0
+                    game.prob_draw = (1 / game.odds_draw) if game.odds_draw > 0 else 0
+
+                    picks = [("home", game.prob_home, game.odds_home), 
+                             ("away", game.prob_away, game.odds_away)]
+                    if game.odds_draw > 0: picks.append(("draw", game.prob_draw, game.odds_draw))
+
+                    best = max(picks, key=lambda x: x[1])
+                    game.best_pick, game.implied_prob, game.best_odds = best
+                    games.append(game)
+
+            self._odds_cache[sport_key] = (time.time(), games)
+            return games
+        except Exception as e:
+            logger.error(f"Odds error: {e}")
+            return []
+
+    def _compute_confidence(self, game: Game) -> float:
+        return game.implied_prob # Simplified for this demo
+
+    async def find_daily_pick(self, target_odds: float = 1.50) -> Optional[BetSelection]:
+        # Using a subset of sports for speed
+        sports = ["soccer_epl", "basketball_nba"]
+        all_games = []
+        for s in sports:
+            all_games.extend(await self.get_odds(s))
+        
+        if not all_games: return None
+        
+        best = max(all_games, key=lambda g: g.implied_prob)
+        return BetSelection(
+            game=best,
+            market="match_winner",
+            selection=best.home_team if best.best_pick == "home" else best.away_team,
+            odds=round(best.best_odds, 2),
+            confidence=round(best.implied_prob * 100, 2)
+        )
+
+# ── SportyBet Booker (Playwright Automation) ─────────────────────────────────
+
+class SportyBetBooker:
+    SPORTYBET_URL = "https://www.sportybet.com/ng"
+    COOKIE_PATH = os.path.join(os.path.dirname(__file__), ".sportybet_session.json")
+
+    def __init__(self):
+        self._browser = None
+        self._context = None
+        self._page = None
+        self._logged_in = False
+
+    async def launch(self):
+        """Start headful Chromium with Stealth enabled."""
+        print(f"DEBUG: Using Python at {sys.executable}")
+        
+        from playwright.async_api import async_playwright
+        
+        pw = await async_playwright().start()
+        
+        # 1. Launch in HEADFUL mode so you can see if you're blocked
+        self._browser = await pw.chromium.launch(headless=False) 
+        
+        # 2. Add a realistic User-Agent
+        self._context = await self._browser.new_context(
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        )
+        
+        # 3. Load session if exists
+        if os.path.exists(self.COOKIE_PATH):
+            try:
+                with open(self.COOKIE_PATH, "r") as f:
+                    storage_state = json.load(f)
+                await self._context.add_cookies(storage_state.get('cookies', []))
+                logger.info("Session cookies loaded")
+            except: pass
+
+        self._page = await self._context.new_page()
+        
+        # 4. Apply Stealth logic
+        #await playwright_stealth.stealth_async(self._page)
+        await stealth(self._page)
+        logger.info("Browser launched with stealth mode enabled")
+
+    async def login(self, phone: str = "", password: str = ""):
+        if not self._page: await self.launch()
+
+        phone = phone or SPORTYBET_PHONE
+        password = password or SPORTYBET_PASSWORD
+
+        try:
+            logger.info(f"Navigating to {self.SPORTYBET_URL}...")
+            await self._page.goto(self.SPORTYBET_URL, wait_until="networkidle")
+
+            # Check if already logged in (look for 'My Account' or balance)
+            if await self._page.query_selector('.m-balance, .my-account'):
+                self._logged_in = True
+                logger.info("Already logged in via cookies")
+                return
+
+            # Click Login button to open modal if necessary
+            login_trigger = await self._page.query_selector('button.m-btn-login, .login-btn')
+            if login_trigger: await login_trigger.click()
+
+            # Fill credentials
+            await self._page.fill('input[type="tel"]', phone)
+            await self._page.fill('input[type="password"]', password)
+            
+            # Use a human-like delay before clicking login
+            await asyncio.sleep(1)
+            await self._page.click('button[type="submit"]')
+
+            # Wait for login to complete
+            await self._page.wait_for_selector('.m-balance', timeout=15000)
+            
+            # Save state
+            state = await self._context.storage_state()
+            with open(self.COOKIE_PATH, "w") as f:
+                json.dump(state, f)
+
+            self._logged_in = True
+            logger.info("Login successful")
+
+        except Exception as e:
+            logger.error(f"Detailed Login Failure: {e}")
+            # Take a screenshot for debugging
+            if self._page:
+                await self._page.screenshot(path="login_error.png")
+                logger.info("Screenshot saved as login_error.png")
+            raise
+
+    async def close(self):
+        if self._browser: await self._browser.close()
+
+# ── Main Execution ──────────────────────────────────────────────────────────
+
+async def main():
+    bot_engine = PredictionEngine()
+    booker = SportyBetBooker()
+
+    print("\n--- Fetching Daily Pick ---")
+    pick = await bot_engine.find_daily_pick()
+    
+    if pick:
+        print(f"\nDaily Pick Result:\n")
+        print(f"{pick.game.home_team} vs {pick.game.away_team}")
+        print(f"Pick: {pick.selection} @ {pick.odds}")
+        print(f"Confidence: {pick.confidence}%")
+        
+        print("\n--- Attempting SportyBet Booking ---")
+        try:
+            await booker.launch()
+            await booker.login()
+            # Booking logic would go here
+        except Exception as e:
+            print(f"Booking flow stopped: {e}")
+        finally:
+            await booker.close()
+    else:
+        print("No suitable picks found today.")
+
+if __name__ == "__main__":
+    asyncio.run(main())

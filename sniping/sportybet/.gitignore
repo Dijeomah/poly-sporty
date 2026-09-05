@@ -1,0 +1,3 @@
+sessions/
+*.db
+.sporty_cache.json

@@ -1,0 +1,25 @@
+# Build-irrelevant
+venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+.idea/
+sniping/
+
+# Secrets — never bake these into an image layer
+.env
+.env.local
+
+# Mutable runtime state — lives on the /data volume instead (see
+# docker/entrypoint.sh), not in the image
+trades.db
+bot.log
+
+# Not needed at runtime
+README.md
+QUICKSTART.md
+plan.md
+polymarket-trading-agent.md
+test_*.py
+analyze_performance.py
+gen_poly_mrkt_key.py

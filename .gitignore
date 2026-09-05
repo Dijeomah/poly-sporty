@@ -1,0 +1,6 @@
+.env
+.claude
+.idea
+venv
+sniping/venv
+sniping/.env

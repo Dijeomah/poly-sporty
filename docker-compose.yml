@@ -1,0 +1,11 @@
+services:
+  polymarket-arb-bot:
+    build: .
+    container_name: polymarket-arb-bot
+    restart: unless-stopped
+    env_file: .env   # PRIVATE_KEY, API_KEY/SECRET/PASSPHRASE, ANTHROPIC_API_KEY
+    volumes:
+      - polymarket-data:/data
+
+volumes:
+  polymarket-data:

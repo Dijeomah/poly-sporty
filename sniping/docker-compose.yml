@@ -1,0 +1,17 @@
+services:
+  sniping-bot:
+    build: .
+    container_name: sniping-bot
+    restart: unless-stopped
+    # Loads TELEGRAM_BOT_TOKEN, ALLOWED_USER_ID, PRIVATE_KEY, ODDS_API_KEY,
+    # etc. from the existing .env — plus add a VNC_PASSWORD line there too
+    # (see DOCKER.md), the entrypoint refuses to start without it.
+    env_file: .env
+    ports:
+      - "6080:6080"   # noVNC web UI — http://localhost:6080/vnc.html
+      - "5900:5900"   # raw VNC, for a native client instead of the browser
+    volumes:
+      - sniping-data:/data
+
+volumes:
+  sniping-data:
