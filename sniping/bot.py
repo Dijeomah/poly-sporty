@@ -37,6 +37,55 @@ logger = logging.getLogger("snipe-bot")
 _pending_otp: dict[int, asyncio.Future] = {}
 
 
+async def tg_retry(coro_factory, retries: int = 3, base_delay: float = 2.0):
+    """Retry a Telegram API call on transient network errors instead of
+    silently losing it — e.g. the "Accumulator BOOKED!" or final result
+    message after a multi-minute /sporty_acca run, which is exactly the
+    kind of message a user shouldn't lose to one flaky read-timeout.
+
+    `coro_factory` is a zero-arg callable returning the awaitable to run
+    (e.g. `lambda: msg.edit_text(...)`) — needed because a coroutine can
+    only be awaited once, so each retry attempt needs a fresh one.
+
+    Note: edit_message_text is idempotent to retry (editing to the same
+    text twice is harmless); send_message/reply_text are not — on the rare
+    case where the first attempt actually reached Telegram but the response
+    timed out, a retry can send a duplicate message. That tradeoff is
+    accepted here: a duplicate status message is a minor annoyance, losing
+    the message (e.g. a booking code) entirely is worse.
+    """
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            return await coro_factory()
+        except (TimedOut, NetworkError) as e:
+            last_exc = e
+            logger.warning(f"Telegram call failed (attempt {attempt + 1}/{retries}): {e}")
+            if attempt < retries - 1:
+                await asyncio.sleep(base_delay * (attempt + 1))
+    logger.error(f"Telegram call failed after {retries} attempts, giving up: {last_exc}")
+    return None
+
+
+async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
+    """Global handler for exceptions raised while processing an update —
+    replaces python-telegram-bot's default "No error handlers are
+    registered, logging exception" with an actual log line, and
+    best-effort lets the user know something went wrong instead of leaving
+    them with silence.
+    """
+    logger.error(f"Unhandled exception while processing update: {context.error}", exc_info=context.error)
+
+    if isinstance(update, Update) and update.effective_chat:
+        try:
+            await tg_retry(lambda: context.bot.send_message(
+                update.effective_chat.id,
+                "Something went wrong processing that — please try again.",
+            ), retries=2)
+        except Exception:
+            pass  # don't let a failed error-notification raise another error
+
+
 def _make_otp_callback(bot, chat_id: int, user_id: int):
     """Build an otp_callback for SportyBot.login_interactive: asks this user
     for their 2FA/OTP code over Telegram and waits (up to 3 min) for their
@@ -45,15 +94,15 @@ def _make_otp_callback(bot, chat_id: int, user_id: int):
         loop = asyncio.get_running_loop()
         fut = loop.create_future()
         _pending_otp[user_id] = fut
-        await bot.send_message(
+        await tg_retry(lambda: bot.send_message(
             chat_id,
             "SportyBet is asking for a verification code (2FA/OTP).\n"
             "Reply with the code you received to continue logging in.",
-        )
+        ))
         try:
             return await asyncio.wait_for(fut, timeout=180)
         except asyncio.TimeoutError:
-            await bot.send_message(chat_id, "Timed out waiting for the verification code.")
+            await tg_retry(lambda: bot.send_message(chat_id, "Timed out waiting for the verification code."))
             return ""
         finally:
             _pending_otp.pop(user_id, None)
@@ -510,7 +559,7 @@ async def cmd_btc_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot = context.bot
 
     async def notify(message: str):
-        await bot.send_message(chat_id, message)
+        await tg_retry(lambda: bot.send_message(chat_id, message))
 
     btc_arb.set_notify_callback(notify)
     btc_arb.start(settings)
@@ -591,27 +640,27 @@ async def cmd_sporty_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot = context.bot
 
     async def notify(message: str):
-        await bot.send_message(chat_id, message)
+        await tg_retry(lambda: bot.send_message(chat_id, message))
 
     sbot.set_notify_callback(notify)
     msg = await update.message.reply_text(f"Searching for daily pick at ~{target_odds} odds...")
     result = await sbot.find_daily_pick(target_odds, settings, days_ahead=days_ahead)
 
     if result.success:
-        await msg.edit_text(
+        await tg_retry(lambda: msg.edit_text(
             f"Daily Pick BOOKED!\n\n"
             f"{result.selections_summary}\n\n"
             f"Booking Code: {result.booking_code}\n"
             f"Use code on sportybet.com.ng",
             reply_markup=InlineKeyboardMarkup([_back_button()]),
-        )
+        ))
     else:
         text = f"Daily Pick Result:\n\n"
         if result.selections_summary:
             text += f"{result.selections_summary}\n\n"
         if result.error:
             text += f"Note: {result.error}"
-        await msg.edit_text(text, reply_markup=InlineKeyboardMarkup([_back_button()]))
+        await tg_retry(lambda: msg.edit_text(text, reply_markup=InlineKeyboardMarkup([_back_button()])))
 
 
 async def cmd_sporty_acca(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -641,26 +690,26 @@ async def cmd_sporty_acca(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot = context.bot
 
     async def notify(message: str):
-        await bot.send_message(chat_id, message)
+        await tg_retry(lambda: bot.send_message(chat_id, message))
 
     sbot.set_notify_callback(notify)
     msg = await update.message.reply_text(f"Building accumulator for {target:.0f}x odds...")
     result = await sbot.generate_accumulator_from_sportybet(target, settings, days_ahead=days_ahead)
 
     if result.success:
-        await msg.edit_text(
+        await tg_retry(lambda: msg.edit_text(
             f"Accumulator BOOKED!\n\n"
             f"{result.selections_summary}\n\n"
             f"Booking Code: {result.booking_code}",
             reply_markup=InlineKeyboardMarkup([_back_button()]),
-        )
+        ))
     else:
         text = f"Accumulator Result:\n\n"
         if result.selections_summary:
             text += f"{result.selections_summary}\n\n"
         if result.error:
             text += f"Note: {result.error}"
-        await msg.edit_text(text, reply_markup=InlineKeyboardMarkup([_back_button()]))
+        await tg_retry(lambda: msg.edit_text(text, reply_markup=InlineKeyboardMarkup([_back_button()])))
 
 
 async def cmd_sporty_rollover(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -682,7 +731,7 @@ async def cmd_sporty_rollover(update: Update, context: ContextTypes.DEFAULT_TYPE
     bot = context.bot
 
     async def notify(message: str):
-        await bot.send_message(chat_id, message)
+        await tg_retry(lambda: bot.send_message(chat_id, message))
 
     sbot.set_notify_callback(notify)
     started = await sbot.start_rollover(days, odds, settings)
@@ -692,19 +741,19 @@ async def cmd_sporty_rollover(update: Update, context: ContextTypes.DEFAULT_TYPE
             [InlineKeyboardButton("Stop Rollover", callback_data="act_sporty_rollover_stop")],
             _back_button(),
         ])
-        await update.message.reply_text(
+        await tg_retry(lambda: update.message.reply_text(
             f"Rollover STARTED\n\n"
             f"Plan: {days} days at {odds} odds/day\n"
             f"Target final odds: {odds ** days:.2f}x\n\n"
             f"You'll get a booking code each day.",
             reply_markup=keyboard,
-        )
+        ))
     else:
-        await update.message.reply_text(
+        await tg_retry(lambda: update.message.reply_text(
             "Could not start rollover. A rollover may already be active.\n"
             "Use /sporty_stop to stop it first.",
             reply_markup=InlineKeyboardMarkup([_back_button()]),
-        )
+        ))
 
 
 async def cmd_sporty_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1048,7 +1097,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bot = context.bot
 
         async def _btc_notify(message: str):
-            await bot.send_message(chat_id, message)
+            await tg_retry(lambda: bot.send_message(chat_id, message))
 
         btc_arb.set_notify_callback(_btc_notify)
         btc_arb.start(settings)
@@ -1113,7 +1162,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bot = context.bot
 
         async def _sporty_pick_notify(message: str):
-            await bot.send_message(chat_id, message)
+            await tg_retry(lambda: bot.send_message(chat_id, message))
 
         sbot.set_notify_callback(_sporty_pick_notify)
         await query.edit_message_text(
@@ -1138,14 +1187,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("Back to SportyBet", callback_data="nav_sporty")],
             _back_button(),
         ])
-        await query.edit_message_text(text, reply_markup=keyboard)
+        await tg_retry(lambda: query.edit_message_text(text, reply_markup=keyboard))
 
     elif data == "act_sporty_acca":
         chat_id = query.message.chat_id
         bot = context.bot
 
         async def _sporty_acca_notify(message: str):
-            await bot.send_message(chat_id, message)
+            await tg_retry(lambda: bot.send_message(chat_id, message))
 
         sbot.set_notify_callback(_sporty_acca_notify)
         await query.edit_message_text(
@@ -1170,7 +1219,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("Back to SportyBet", callback_data="nav_sporty")],
             _back_button(),
         ])
-        await query.edit_message_text(text, reply_markup=keyboard)
+        await tg_retry(lambda: query.edit_message_text(text, reply_markup=keyboard))
 
     elif data == "act_sporty_rollover_start":
         if sbot.rollover and sbot.rollover.active:
@@ -1187,7 +1236,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bot = context.bot
 
         async def _sporty_rollover_notify(message: str):
-            await bot.send_message(chat_id, message)
+            await tg_retry(lambda: bot.send_message(chat_id, message))
 
         sbot.set_notify_callback(_sporty_rollover_notify)
         days = settings.sporty_rollover_days
@@ -1199,13 +1248,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("Status", callback_data="nav_sporty")],
             _back_button(),
         ])
-        await query.edit_message_text(
+        await tg_retry(lambda: query.edit_message_text(
             f"Rollover STARTED\n\n"
             f"Plan: {days} days at {odds} odds/day\n"
             f"Target: {odds ** days:.2f}x\n\n"
             f"You'll get daily booking codes.",
             reply_markup=keyboard,
-        )
+        ))
 
     elif data == "act_sporty_rollover_stop":
         if not sbot.rollover or not sbot.rollover.active:
@@ -1283,7 +1332,19 @@ def main():
     if ALLOWED_USER_ID == 0:
         print("WARNING: ALLOWED_USER_ID not set — bot will reject all commands!")
 
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    # Longer read/connect timeouts than PTB's defaults — reduces how often a
+    # slow/flaky connection (seen in this container's network) trips a
+    # TimedOut on an otherwise-fine request in the first place.
+    app = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .connect_timeout(20)
+        .read_timeout(20)
+        .write_timeout(20)
+        .pool_timeout(20)
+        .build()
+    )
+    app.add_error_handler(error_handler)
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("wallet", cmd_wallet))
