@@ -29,6 +29,14 @@ RUN pip install --no-cache-dir --timeout 180 --retries 10 solana==0.34.3 solders
 RUN pip install --no-cache-dir --timeout 180 --retries 10 "playwright>=1.40.0"
 RUN playwright install --with-deps chromium
 
+# Claude Code CLI — sportybet/claude_analyst.py shells out to `claude -p` to
+# research and veto picks. Authenticates via CLAUDE_CODE_OAUTH_TOKEN in .env
+# (from `claude setup-token`, uses your Claude subscription) — see DOCKER.md.
+RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm \
+    && rm -rf /var/lib/apt/lists/* \
+    && npm install -g @anthropic-ai/claude-code \
+    && npm cache clean --force
+
 COPY . .
 RUN chmod +x docker/entrypoint.sh
 

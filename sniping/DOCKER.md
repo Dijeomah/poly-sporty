@@ -42,16 +42,40 @@ positions all live on the `sniping-data` volume (`/data` in the container —
 see `docker/entrypoint.sh` for the symlinks), so they survive
 `docker compose restart` / image rebuilds.
 
-## Known limitation: Claude analysis
+## Claude analysis of picks
 
-`sportybet/claude_analyst.py` shells out to the `claude` CLI (Claude Code)
-to have the SportyBet Analyst agent rank picks — that CLI is tied to a
-*host machine's* own authenticated Claude Code installation and isn't
-inside this container. The code already checks for it
-(`claude_analyst.is_available()`) and silently falls back to pure odds
--based ranking when it's missing, so nothing breaks — accumulators just
-won't get the Claude-analysis pass while running containerized, unless you
-separately install and authenticate `claude` inside the image yourself.
+Every accumulator, rollover day and daily pick is run past Claude before
+booking (`sportybet/claude_analyst.py` + `sportybet/sportybet-agent.md`).
+Claude web-searches each shortlisted match (form, injuries, H2H, lineups),
+scores the pick, and vetoes weak ones — only games it backs at or above
+`sporty_claude_min_confidence` (default 75%) go on the ticket. The Telegram
+chat gets a summary of what was approved/vetoed and why.
+
+The image includes the `claude` CLI. To log it in with your Claude
+subscription (no API credits needed):
+
+1. On any machine where you're logged in to Claude Code (e.g. your Mac),
+   run:
+   ```bash
+   claude setup-token
+   ```
+   and copy the long-lived token it prints.
+2. Add it to `sniping/.env` on the server:
+   ```
+   CLAUDE_CODE_OAUTH_TOKEN=<token>
+   ```
+3. Rebuild: `docker compose up --build -d`
+4. Check it works inside the container:
+   ```bash
+   docker compose exec sniping-bot claude -p "reply with OK"
+   ```
+
+If the CLI is missing, not logged in, or times out, the bot falls back to
+the old odds-only ranking rather than failing. Tunables in `config.py`
+(`BotSettings`): `sporty_claude_enabled`, `sporty_claude_research`,
+`sporty_claude_min_confidence`, `sporty_claude_max_games`. Web research on
+30 games takes roughly 10–15 minutes per accumulator and counts against your
+Claude plan's usage limits — lower `sporty_claude_max_games` if you hit them.
 
 ## Security note
 

@@ -720,6 +720,49 @@ class PredictionEngine:
                      f"total odds: {current_odds:.2f} (target: {target_total_odds})")
         return selections
 
+    async def daily_pick_candidates(
+        self,
+        target_odds: float = 1.50,
+        min_prob: float = 0.85,
+        sport_keys: Optional[list[str]] = None,
+        days_ahead: Optional[float] = None,
+    ) -> list[Game]:
+        """High-confidence games ordered best-first for a single daily pick:
+        closest to target odds, then highest confidence."""
+        games = await self.find_high_confidence_games(
+            min_prob=min_prob, sport_keys=sport_keys, days_ahead=days_ahead
+        )
+
+        if not games:
+            return []
+
+        # Filter for games near target odds (within +/- 0.3)
+        candidates = [g for g in games if abs(g.best_odds - target_odds) <= 0.3]
+
+        # If no games near target, take any high-confidence game
+        if not candidates:
+            candidates = games
+
+        # Sort by closest to target odds, then by confidence
+        candidates.sort(key=lambda g: (abs(g.best_odds - target_odds), -g.confidence))
+        return candidates
+
+    @staticmethod
+    def selection_for(game: Game) -> BetSelection:
+        selection_name = {
+            "home": game.home_team,
+            "away": game.away_team,
+            "draw": "Draw",
+        }.get(game.best_pick, game.best_pick)
+
+        return BetSelection(
+            game=game,
+            market="match_winner",
+            selection=selection_name,
+            odds=round(game.best_odds, 2),
+            confidence=game.confidence,
+        )
+
     async def find_daily_pick(
         self,
         target_odds: float = 1.50,
@@ -738,37 +781,11 @@ class PredictionEngine:
         Returns:
             BetSelection or None
         """
-        games = await self.find_high_confidence_games(
-            min_prob=min_prob, sport_keys=sport_keys, days_ahead=days_ahead
+        candidates = await self.daily_pick_candidates(
+            target_odds=target_odds, min_prob=min_prob,
+            sport_keys=sport_keys, days_ahead=days_ahead,
         )
-
-        if not games:
-            return None
-
-        # Filter for games near target odds (within +/- 0.3)
-        candidates = [g for g in games if abs(g.best_odds - target_odds) <= 0.3]
-
-        # If no games near target, take any high-confidence game
-        if not candidates:
-            candidates = games
-
-        # Sort by closest to target odds, then by confidence
-        candidates.sort(key=lambda g: (abs(g.best_odds - target_odds), -g.confidence))
-
-        best = candidates[0]
-        selection_name = {
-            "home": best.home_team,
-            "away": best.away_team,
-            "draw": "Draw",
-        }.get(best.best_pick, best.best_pick)
-
-        return BetSelection(
-            game=best,
-            market="match_winner",
-            selection=selection_name,
-            odds=round(best.best_odds, 2),
-            confidence=best.confidence,
-        )
+        return self.selection_for(candidates[0]) if candidates else None
 
 
 # ── SportyBet Booker (Direct API) ─────────────────────────────────────────────
@@ -1898,6 +1915,7 @@ class SportyBot:
         now_ms = time.time() * 1000
         seen_sport_ids = set()
         candidates = []
+        sport_name_by_id = {v: k for k, v in self.booker.SPORT_IDS.items()}
 
         for sport_id in self.booker.SPORT_IDS.values():
             if sport_id in seen_sport_ids:  # rugbyleague/rugbyunion/rugby all share sr:sport:12
@@ -1937,6 +1955,7 @@ class SportyBot:
                     "home_team": event.get("homeTeamName", ""),
                     "away_team": event.get("awayTeamName", ""),
                     "league": tournament.get("name", ""),
+                    "sport": sport_name_by_id.get(sport_id, ""),
                     "commence_time": commence_time,
                     "safe": safe,
                 })
@@ -1945,51 +1964,146 @@ class SportyBot:
         logger.info(f"Built {len(candidates)} bookable candidates directly from SportyBet's own events")
         return candidates
 
-    async def _apply_claude_analysis(self, candidates: list[dict], batch_size: int = 10) -> list[dict]:
-        """Have the Claude Code CLI (sportybet-agent.md) rank the top
-        odds-based candidates by analytical confidence, and reorder them
-        accordingly — the actual odds/markets still come only from
-        SportyBet's real live data, Claude just re-prioritizes among
-        already-verified candidates. Falls back to the original odds-based
-        order untouched if the CLI is unavailable or its output can't be
-        parsed (same graceful-skip behavior as the rest of this bot when
-        Claude analysis isn't available).
+    async def _apply_claude_analysis(self, candidates: list[dict], settings) -> list[dict]:
+        """Run the candidates past the SportyBet Analyst agent (Claude Code
+        CLI + sportybet-agent.md), which web-researches each match and scores
+        the pick the bot wants to back on it.
+
+        Rank + veto: returns only the candidates Claude backed at or above
+        settings.sporty_claude_min_confidence, most confident first, each
+        with a `claude` dict ({confidence, verdict, note}) attached. The
+        odds/markets still come only from SportyBet's real live data —
+        Claude just decides which verified candidates are worth using.
+
+        Falls back to the original odds-based order untouched if Claude is
+        disabled, the CLI is missing, or every batch fails — same graceful
+        skip as the rest of this bot when Claude analysis isn't available.
         """
+        if not getattr(settings, "sporty_claude_enabled", True) or not candidates:
+            return candidates
         if not claude_analyst.is_available():
+            logger.info("claude CLI not on PATH — using odds-only ranking")
             return candidates
 
-        batch = candidates[:batch_size]
-        rest = candidates[batch_size:]
+        research = getattr(settings, "sporty_claude_research", True)
+        min_conf = getattr(settings, "sporty_claude_min_confidence", 0.75)
+        pool = candidates[:getattr(settings, "sporty_claude_max_games", 30)]
+
+        await self._notify(
+            f"Claude is analysing {len(pool)} games"
+            f"{' (researching form, injuries, H2H)' if research else ''}... "
+            f"this can take a few minutes."
+        )
 
         try:
-            analysis = await claude_analyst.analyze_candidates(
-                batch, self.booker._SAFE_MARKET_NAMES
+            analysis = await claude_analyst.analyze_all(
+                pool, self.booker._SAFE_MARKET_NAMES, research=research
             )
         except Exception as e:
             logger.error(f"Claude analysis failed: {e}")
+            analysis = None
+
+        if analysis is None:
+            await self._notify("Claude analysis unavailable right now — falling back to odds-only ranking.")
             return candidates
 
-        if not analysis or not analysis.get("ranked_picks"):
-            return candidates
+        verdicts, flags = analysis
+        approved, vetoed, skipped = [], [], 0
+        for c, v in zip(pool, verdicts):
+            if v is None:
+                skipped += 1
+                continue
+            c = {**c, "claude": v}
+            if v["verdict"] == "avoid" or v["confidence"] < min_conf:
+                vetoed.append(c)
+            else:
+                approved.append(c)
+        approved.sort(key=lambda c: -c["claude"]["confidence"])
 
-        ranked = sorted(analysis["ranked_picks"], key=lambda p: -p.get("confidence", 0))
-        order = [p["match_index"] for p in ranked if isinstance(p.get("match_index"), int)]
-        seen = set(order)
+        lines = [
+            f"Claude analysed {len(pool) - skipped} games: "
+            f"{len(approved)} approved, {len(vetoed)} vetoed"
+            + (f", {skipped} not analysed" if skipped else "")
+            + f" (min confidence {min_conf:.0%})."
+        ]
+        if vetoed:
+            lines.append("\nVetoed:")
+            for c in sorted(vetoed, key=lambda c: c["claude"]["confidence"])[:8]:
+                lines.append(
+                    f"- {c['home_team']} vs {c['away_team']} "
+                    f"({c['claude']['confidence']:.0%}): {c['claude']['note'][:120]}"
+                )
+        flag_lines = [
+            f"- {pool[f['match_index']]['home_team']} vs {pool[f['match_index']]['away_team']}: {f.get('issue', '')}"
+            for f in flags
+        ]
+        if flag_lines:
+            lines.append("\nPricing inconsistencies flagged:")
+            lines.extend(flag_lines[:5])
+        await self._notify("\n".join(lines))
 
-        reordered = [batch[i] for i in order if 0 <= i < len(batch)]
-        leftover = [c for i, c in enumerate(batch) if i not in seen]
+        return approved
 
-        flags = analysis.get("flags", [])
-        if flags:
-            flag_lines = [
-                f"- {batch[f['match_index']]['home_team']} vs {batch[f['match_index']]['away_team']}: {f.get('issue', '')}"
-                for f in flags
-                if isinstance(f.get("match_index"), int) and 0 <= f["match_index"] < len(batch)
+    async def _claude_daily_pick(self, games: list, settings, max_games: int = 8):
+        """Pick the daily game with Claude: research the top `max_games`
+        odds-ranked candidates, veto weak ones, return the most confident
+        survivor as (BetSelection, verdict). Falls back to the top
+        odds-ranked game with verdict None when Claude is disabled or
+        unavailable; returns (None, None) if Claude vetoed them all.
+        """
+        fallback = (self.engine.selection_for(games[0]), None)
+        if not getattr(settings, "sporty_claude_enabled", True) or not claude_analyst.is_available():
+            return fallback
+
+        pool = games[:max_games]
+        items = []
+        for g in pool:
+            sel = self.engine.selection_for(g)
+            odds_lines = [f"1X2: Home={g.odds_home:.2f}, Draw={g.odds_draw:.2f}, Away={g.odds_away:.2f}"]
+            if g.api_football_prob:
+                odds_lines.append(f"API-Football model probability for the pick: {g.api_football_prob:.0%}")
+            items.append({
+                "home_team": g.home_team,
+                "away_team": g.away_team,
+                "league": g.league,
+                "sport": g.sport,
+                "commence_time": g.commence_time,
+                "pick": {"market": "Match winner", "outcome": sel.selection, "odds": sel.odds},
+                "odds_lines": odds_lines,
+            })
+
+        research = getattr(settings, "sporty_claude_research", True)
+        min_conf = getattr(settings, "sporty_claude_min_confidence", 0.75)
+        await self._notify(
+            f"Claude is analysing the top {len(pool)} candidates"
+            f"{' (researching form, injuries, H2H)' if research else ''}..."
+        )
+        try:
+            analysis = await claude_analyst.analyze_all(
+                items, self.booker._SAFE_MARKET_NAMES, research=research,
+            )
+        except Exception as e:
+            logger.error(f"Claude daily-pick analysis failed: {e}")
+            analysis = None
+        if analysis is None:
+            await self._notify("Claude analysis unavailable right now — using the odds-based pick.")
+            return fallback
+
+        verdicts, _ = analysis
+        approved = [
+            (g, v) for g, v in zip(pool, verdicts)
+            if v and v["verdict"] != "avoid" and v["confidence"] >= min_conf
+        ]
+        if not approved:
+            reasons = [
+                f"- {g.home_team} vs {g.away_team} ({v['confidence']:.0%}): {v['note'][:120]}"
+                for g, v in zip(pool, verdicts) if v
             ]
-            if flag_lines:
-                await self._notify("Claude flagged some pricing inconsistencies:\n" + "\n".join(flag_lines))
+            await self._notify("Claude vetoed every daily-pick candidate:\n" + "\n".join(reasons[:8]))
+            return None, None
 
-        return reordered + leftover + rest
+        game, verdict = max(approved, key=lambda gv: gv[1]["confidence"])
+        return self.engine.selection_for(game), verdict
 
     async def generate_accumulator_from_sportybet(self, target_odds: float, settings,
                                                    days_ahead: Optional[float] = None,
@@ -2050,7 +2164,12 @@ class SportyBot:
                         "pool since no unused games remain"
                     )
 
-            candidates = await self._apply_claude_analysis(candidates)
+            candidates = await self._apply_claude_analysis(candidates, settings)
+            if not candidates:
+                return BookingResult(
+                    success=False,
+                    error="Claude vetoed every candidate game — nothing safe enough to book right now.",
+                )
 
             max_legs = settings.sporty_max_legs
             api_selections = []
@@ -2079,9 +2198,10 @@ class SportyBot:
                 api_selections.append(api_sel)
 
                 current_odds *= safe["odds"]
+                claude_note = f" | Claude {c['claude']['confidence']:.0%}" if c.get("claude") else ""
                 summary_lines.append(
                     f"{len(api_selections)}. {c['home_team']} vs {c['away_team']}\n"
-                    f"   {leg_desc} @ {safe['odds']:.2f}"
+                    f"   {leg_desc} @ {safe['odds']:.2f}{claude_note}"
                 )
                 leg_details.append({
                     "event_id": c["event"]["eventId"],
@@ -2093,6 +2213,7 @@ class SportyBot:
                     "selection": leg_desc,
                     "pick_kind": pick_kind,
                     "odds": safe["odds"],
+                    "confidence": c["claude"]["confidence"] if c.get("claude") else 1.0 / safe["odds"],
                 })
 
             if not api_selections:
@@ -2150,7 +2271,7 @@ class SportyBot:
                             pick_side=leg["pick_kind"],
                             pick_kind=leg["pick_kind"],
                             odds=leg["odds"],
-                            confidence=1.0 / leg["odds"],
+                            confidence=leg["confidence"],
                             booking_code=code,
                             commence_time=leg["commence_time"],
                         )
@@ -2202,24 +2323,34 @@ class SportyBot:
         await self._notify(f"Searching for daily pick at ~{target_odds} odds{window_note}...")
 
         try:
-            selection = await self.engine.find_daily_pick(
+            games = await self.engine.daily_pick_candidates(
                 target_odds=target_odds,
                 min_prob=settings.sporty_min_probability,
                 days_ahead=days_ahead,
             )
 
-            if not selection:
+            if not games:
                 return BookingResult(
                     success=False,
                     error="No games found matching criteria"
                 )
 
+            selection, claude_verdict = await self._claude_daily_pick(games, settings)
+            if not selection:
+                return BookingResult(
+                    success=False,
+                    error="Claude vetoed every candidate game — nothing safe enough to book right now.",
+                )
+
             game = selection.game
+            if claude_verdict:
+                selection.confidence = claude_verdict["confidence"]
+            claude_line = f"\nClaude: {claude_verdict['note']}" if claude_verdict else ""
             summary = (
                 f"{game.home_team} vs {game.away_team}\n"
                 f"League: {game.league}\n"
                 f"Pick: {selection.selection} @ {selection.odds:.2f}\n"
-                f"Confidence: {selection.confidence:.0%}"
+                f"Confidence: {selection.confidence:.0%}{claude_line}"
             )
 
             await self._notify(f"Found pick:\n{summary}\n\nBooking on SportyBet...")
@@ -2235,7 +2366,7 @@ class SportyBot:
                     f"{game.home_team} vs {game.away_team}\n"
                     f"League: {game.league}\n"
                     f"Pick: {booked['selection']} @ {booked['odds']:.2f}\n"
-                    f"Confidence: {selection.confidence:.0%}"
+                    f"Confidence: {selection.confidence:.0%}{claude_line}"
                 )
             else:
                 booked = None

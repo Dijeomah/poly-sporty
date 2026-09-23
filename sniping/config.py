@@ -64,6 +64,12 @@ class BotSettings:
     sporty_max_legs: int = 40              # Max accumulator legs
     sporty_enabled: bool = True            # Toggle SportyBet on/off
 
+    # ── Claude analysis of generated picks (sportybet/claude_analyst.py) ─────
+    sporty_claude_enabled: bool = True         # Run picks past Claude before booking
+    sporty_claude_research: bool = True        # Let Claude web-search form/injuries/H2H
+    sporty_claude_min_confidence: float = 0.75 # Veto picks Claude rates below this
+    sporty_claude_max_games: int = 30          # Candidates analysed per accumulator
+
 
 # Singleton settings instance
 settings = BotSettings()
